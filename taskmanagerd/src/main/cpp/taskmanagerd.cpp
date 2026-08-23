@@ -39,42 +39,55 @@ static std::string toLower(std::string s) {
 }
 
 static bool isCpuThermalType(const std::string& type) {
+    // Prefix match only: loose substrings like "soc" also catch unrelated
+    // zones (socd exposes raw counts that are not millidegrees)
     std::string t = toLower(type);
-    return (t.find("cpu") != std::string::npos) ||
-           (t.find("soc") != std::string::npos) ||
-           (t.find("ap")  != std::string::npos) ||
-           (t.find("cluster") != std::string::npos);
+    return t.rfind("cpu", 0) == 0;
 }
 
 int getCpuTemperatureCelsius() {
     const std::string basePath = "/sys/class/thermal/";
-    DIR* dir = opendir(basePath.c_str());
-    if (!dir) return -1;
 
-    struct dirent* entry;
+    // Zone paths are discovered once by scanning; afterwards the directory
+    // walk is skipped and only the cached candidates are re-checked. The
+    // type file is verified every poll because zone numbering can shift
+    // mid-run, and a stale path would silently read the wrong sensor.
+    static std::vector<std::string> cpuZonePaths;
+
+    if (cpuZonePaths.empty()) {
+        DIR* dir = opendir(basePath.c_str());
+        if (!dir) return -1;
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name.find("thermal_zone") == std::string::npos) continue;
+
+            std::string zonePath = basePath + name;
+            std::ifstream typeFile(zonePath + "/type");
+            std::string type;
+            if (!typeFile.is_open() || !std::getline(typeFile, type)) continue;
+            if (isCpuThermalType(type)) cpuZonePaths.push_back(zonePath);
+        }
+        closedir(dir);
+
+        if (cpuZonePaths.empty()) return -1;
+    }
+
     int maxTemp = -1;
-
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name.find("thermal_zone") == std::string::npos) continue;
-
-        std::string zonePath = basePath + name;
-        std::ifstream typeFile(zonePath + "/type");
-        if (!typeFile.is_open()) continue;
-
+    std::vector<std::string> stillValid;
+    for (const std::string& zonePath : cpuZonePaths) {
         std::string type;
-        std::getline(typeFile, type);
-        typeFile.close();
-
+        std::ifstream typeFile(zonePath + "/type");
+        if (!typeFile.is_open() || !std::getline(typeFile, type)) continue;
         if (!isCpuThermalType(type)) continue;
+        stillValid.push_back(zonePath);
 
         std::ifstream tempFile(zonePath + "/temp");
         if (!tempFile.is_open()) continue;
 
         long raw = 0;
         tempFile >> raw;
-        tempFile.close();
-
         if (raw <= 0) continue;
 
         int tempC = (raw > 1000) ? static_cast<int>(raw / 1000) : static_cast<int>(raw);
@@ -83,7 +96,11 @@ int getCpuTemperatureCelsius() {
         }
     }
 
-    closedir(dir);
+    if (stillValid.empty())
+        cpuZonePaths.clear();  // numbering changed; rediscover on next poll
+    else
+        cpuZonePaths.swap(stillValid);
+
     return maxTemp;
 }
 
@@ -245,11 +262,12 @@ static int readBusyPercentageFile(const std::string& path) {
 }
 
 // Scans /sys/class/devfreq for a GPU-related node exposing a "load" file.
-// Works on many SoCs (Exynos, MediaTek, Kirin, etc.).
-static int readDevfreqGpuLoad() {
+// Works on many SoCs (Exynos, MediaTek, Kirin, etc.). Returns the load file
+// path, or an empty string when no GPU devfreq node exists.
+static std::string findDevfreqGpuLoadPath() {
     const fs::path base("/sys/class/devfreq");
     std::error_code ec;
-    if (!fs::is_directory(base, ec)) return -1;
+    if (!fs::is_directory(base, ec)) return {};
 
     for (const auto& entry : fs::directory_iterator(base, ec)) {
         if (ec) break;
@@ -261,45 +279,58 @@ static int readDevfreqGpuLoad() {
             name.find("panfrost") == std::string::npos) {
             continue;
         }
-        int load = readBusyPercentageFile((entry.path() / "load").string());
-        if (load >= 0) return load;
+        const std::string loadPath = (entry.path() / "load").string();
+        if (readBusyPercentageFile(loadPath) >= 0) return loadPath;
     }
-    return -1;
+    return {};
 }
 
+// Probe sources in order; the first one that yields a valid reading is
+// remembered, so steady-state polls cost a single file read instead of a
+// dozen failed opens plus a devfreq directory scan. If the cached source
+// later fails (GPU powered down, node moved) the full probe simply reruns.
 int calculateGpuUsage() {
-    // Qualcomm Adreno (KGSL)
-    int usage = readBusyPercentageFile("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
-    if (usage >= 0) return usage;
-    usage = readBusyPercentageFile("/sys/class/kgsl/kgsl-3d0/gpubusy");
-    if (usage >= 0) return usage;
-    usage = readBusyPercentageFile("/sys/class/kgsl/kgsl-3d0/gpu_busy");
-    if (usage >= 0) return usage;
+    static const char* const kProbePaths[] = {
+        // Qualcomm Adreno (KGSL)
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        "/sys/class/kgsl/kgsl-3d0/gpubusy",
+        "/sys/class/kgsl/kgsl-3d0/gpu_busy",
+        // ARM Mali
+        "/sys/class/misc/mali0/device/utilization",
+        "/sys/class/misc/mali0/device/gpu_busy_percentage",
+        "/proc/mali/utilization",
+        // Samsung Exynos / generic
+        "/sys/kernel/gpu/gpu_busy",
+        "/sys/kernel/gpu/gpu_busy_percentage",
+        // Root-only debugfs paths
+        "/sys/kernel/debug/kgsl/kgsl-3d0/gpubusy",
+        "/d/kgsl/kgsl-3d0/gpubusy",
+    };
+    static std::string resolvedPath;
 
-    // ARM Mali
-    usage = readBusyPercentageFile("/sys/class/misc/mali0/device/utilization");
-    if (usage >= 0) return usage;
-    usage = readBusyPercentageFile("/sys/class/misc/mali0/device/gpu_busy_percentage");
-    if (usage >= 0) return usage;
-    usage = readBusyPercentageFile("/proc/mali/utilization");
-    if (usage >= 0) return usage;
+    if (!resolvedPath.empty()) {
+        int usage = readBusyPercentageFile(resolvedPath);
+        if (usage >= 0) return usage;
+        resolvedPath.clear();
+    }
 
-    // Samsung Exynos / generic
-    usage = readBusyPercentageFile("/sys/kernel/gpu/gpu_busy");
-    if (usage >= 0) return usage;
-    usage = readBusyPercentageFile("/sys/kernel/gpu/gpu_busy_percentage");
-    if (usage >= 0) return usage;
+    for (const char* path : kProbePaths) {
+        int usage = readBusyPercentageFile(path);
+        if (usage >= 0) {
+            resolvedPath = path;
+            return usage;
+        }
+    }
 
-    // Root-only debugfs paths
-    usage = readBusyPercentageFile("/sys/kernel/debug/kgsl/kgsl-3d0/gpubusy");
-    if (usage >= 0) return usage;
-    usage = readBusyPercentageFile("/d/kgsl/kgsl-3d0/gpubusy");
-    if (usage >= 0) return usage;
-
-    // Generic devfreq load
-    usage = readDevfreqGpuLoad();
-    if (usage >= 0) return usage;
-
+    // Generic devfreq load: last resort because resolving it scans a directory
+    const std::string devfreqLoad = findDevfreqGpuLoadPath();
+    if (!devfreqLoad.empty()) {
+        int usage = readBusyPercentageFile(devfreqLoad);
+        if (usage >= 0) {
+            resolvedPath = devfreqLoad;
+            return usage;
+        }
+    }
     return -1;
 }
 
