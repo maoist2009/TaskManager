@@ -20,10 +20,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -86,39 +83,14 @@ fun ProcessSearchBar(
                     onExpandedChange = { expanded = it },
                     placeholder = { Text(stringResource(strings.search)) },
                     trailingIcon = {
-                        var showMoreMenu by remember { mutableStateOf(false) }
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = {
-                                //showFilter.value = true
-                                showMoreMenu = true
-                            }) {
-                                Icon(imageVector = Icons.Outlined.MoreVert, null)
-                            }
-                        }
-
-                        DropdownMenu(expanded = showMoreMenu, onDismissRequest = {
-                            showMoreMenu = false
-                        }) {
-                            DropdownMenuItem(text = {
-                                Text(stringResource(strings.filters))
-                            }, onClick = {
-                                showMoreMenu = false
-                                showFilter.value = true
-                            }, leadingIcon = {
+                            IconButton(onClick = { showFilter.value = true }) {
                                 Icon(imageVector = Filter, null)
-                            })
+                            }
 
-                            DropdownMenuItem(text = {
-                                Text(stringResource(strings.sort))
-                            }, onClick = {
-                                showMoreMenu = false
-                                showSort.value = true
-                            }, leadingIcon = {
+                            IconButton(onClick = { showSort.value = true }) {
                                 Icon(imageVector = Sort, null)
-                            })
-
-
-
+                            }
                         }
                     },
                     leadingIcon = {
