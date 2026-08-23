@@ -171,7 +171,6 @@
     <string name="min">Мин</string>
     <string name="current">Текущая</string>
     <string name="max">Макс</string>
-    <string name="temp_c_estimated">%1$s°C (оценочно)</string>
     <string name="cores_count">Ядер: %1$d</string>
 
     <string name="ram_label">RAM: %1$s/%2$s (%3$d%%)</string>

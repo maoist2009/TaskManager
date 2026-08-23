@@ -161,7 +161,7 @@ fun CPU(modifier: Modifier = Modifier, viewModel: ProcessViewModel) {
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            InfoItem(stringResource(strings.temperature), if (temperature.toIntOrNull() != null) stringResource(strings.temp_c_estimated, temperature) else temperature)
+                            InfoItem(stringResource(strings.temperature), if (temperature.toIntOrNull() != null) "$temperature°C" else temperature)
                         }
                     }
                 }

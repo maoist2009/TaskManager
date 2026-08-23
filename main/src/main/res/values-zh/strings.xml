@@ -179,7 +179,6 @@
     <string name="min">最小频率</string>
     <string name="current">当前频率</string>
     <string name="max">最大频率</string>
-    <string name="temp_c_estimated">%1$s°C (estimated)</string>
     <string name="cores_count">%1$d 个核心</string>
 
     <!-- RAM Screen -->

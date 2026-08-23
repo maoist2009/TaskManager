@@ -179,7 +179,6 @@
     <string name="min">Min</string>
     <string name="current">Current</string>
     <string name="max">Max</string>
-    <string name="temp_c_estimated">%1$s°C (estimated)</string>
     <string name="cores_count">%1$d cores</string>
 
     <!-- RAM Screen -->
