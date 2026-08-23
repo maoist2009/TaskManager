@@ -23,15 +23,16 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import com.rk.bridge.OpenSourceOnly
 import com.rk.bridge.ProBridge
 import com.rk.bridge.bridge
 import com.rk.taskmanager.ProcessViewModel
 import com.rk.taskmanager.R
 import com.rk.taskmanager.navControllerRef
+import com.rk.taskmanager.screens.battery.BatteryScreen
 import com.rk.taskmanager.screens.cpu.CPU
 import com.rk.taskmanager.screens.gpu.GPU
 import com.rk.taskmanager.screens.gpu.GpuViewModel
+import com.rk.taskmanager.screens.net.NetScreen
 import com.rk.taskmanager.screens.ram.RAM
 import com.rk.taskmanager.settings.SettingsRoutes
 import com.rk.commons.strings
@@ -82,9 +83,10 @@ private val tabs = listOf(
     ResourceTab(
         labelRes = strings.net,
         icon = TabIcon.Vector(Icons.Outlined.NetworkCheck),
-        content = { _, _, _ ->
+        content = { modifier, _, _ ->
+            // TEMP: fall back to the local net screen while the pro module is absent
             if (bridge != null) bridge!!.NetScreen()
-            else OpenSourceOnly()
+            else NetScreen(modifier)
         }
     ),
 
@@ -93,9 +95,10 @@ private val tabs = listOf(
     ResourceTab(
         labelRes = strings.bat,
         icon = TabIcon.Vector(Icons.Outlined.BatteryChargingFull),
-        content = { _, _, _ ->
+        content = { modifier, _, _ ->
+            // TEMP: fall back to the local battery screen while the pro module is absent
             if (bridge != null) bridge!!.BatteryScreen()
-            else OpenSourceOnly()
+            else BatteryScreen(modifier)
         }
     )
 
