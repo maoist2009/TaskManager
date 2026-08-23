@@ -16,6 +16,11 @@ suspend fun startDaemon(
 ): DaemonResult {
     val daemonFile = File(application!!.applicationInfo.nativeLibraryDir, "libtaskmanagerd.so")
     val result = withContext(Dispatchers.IO) {
+        // A live daemon already owns the I/O; respawning would leak a second
+        // root process nobody ever claims (onResume retries this constantly)
+        if (isConnected) {
+            return@withContext DaemonResult.DAEMON_ALREADY_BEING_STARTED
+        }
         if (daemonCalled) {
             return@withContext DaemonResult.DAEMON_ALREADY_BEING_STARTED
         }
@@ -31,6 +36,16 @@ suspend fun startDaemon(
                     if (!ShizukuShell.isPermissionGranted()) {
                         return@withContext DaemonResult.SHIZUKU_PERMISSION_DENIED
                     }
+
+                    // Clear leftovers from crashed sessions or abandoned spawns;
+                    // pkill exiting non-zero simply means nothing was running.
+                    // Match the full path: a bare filename pattern would kill
+                    // any unrelated process whose cmdline merely mentions it
+                    ShizukuShell.newProcess(
+                        arrayOf<String?>("pkill", "-f", daemonFile.absolutePath),
+                        null,
+                        "/"
+                    )
 
                     val process = ShizukuShell.startStreamingProcess(
                         cmd = arrayOf(daemonFile.absolutePath),
@@ -58,6 +73,13 @@ suspend fun startDaemon(
                     }
 
                     val cmd = arrayOf("su", "-c", daemonFile.absolutePath)
+                    // Clear leftovers from crashed sessions or abandoned spawns;
+                    // pkill exiting non-zero simply means nothing was running.
+                    // Match the full path: a bare filename pattern would kill
+                    // any unrelated process whose cmdline merely mentions it
+                    Runtime.getRuntime().exec(
+                        arrayOf("su", "-c", "pkill -f ${daemonFile.absolutePath}")
+                    ).waitFor()
                     val processBuilder = ProcessBuilder(*cmd)
                     processBuilder.directory(File("/"))
 
