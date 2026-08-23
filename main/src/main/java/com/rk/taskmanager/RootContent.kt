@@ -3,6 +3,8 @@ package com.rk.taskmanager
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavController
 import androidx.navigation.compose.NavHost
@@ -84,7 +86,10 @@ fun MainActivity.RootContent(modifier: Modifier = Modifier) {
 
                 composable("proc/{pid}") {
                     val pid = it.arguments?.getString("pid")!!.toInt()
-                    val proc = procByPid[pid]?.get()
+                    // Resolve live so list refreshes (which replace ProcessUiModel instances) don't orphan the detail page
+                    val liveList by viewModel.uiProcesses.collectAsState()
+                    val proc = liveList.find { it.proc.pid == pid }
+                        ?: procByPid[pid]?.get()
 
                     if (proc != null) {
                         LaunchedEffect(Unit) {
@@ -95,7 +100,9 @@ fun MainActivity.RootContent(modifier: Modifier = Modifier) {
                         }
                         ProcessInfo(proc = proc, navController = navController, viewModel = viewModel)
                     }else{
-                        navController.popBackStack()
+                        LaunchedEffect(pid) {
+                            navController.popBackStack()
+                        }
                     }
                 }
             }

@@ -5,16 +5,21 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.LauncherActivityInfo
+import android.content.pm.LauncherApps
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.SystemClock
+import android.os.UserHandle
 import android.provider.Settings
 import android.system.Os
 import android.system.OsConstants
+import android.util.Log
 import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -35,6 +40,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -54,10 +60,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -67,7 +75,6 @@ import androidx.core.graphics.createBitmap
 import androidx.core.net.toUri
 import androidx.lifecycle.viewModelScope
 import androidx.navigation.NavController
-import com.rk.bridge.bridge
 import com.rk.components.SettingsToggle
 import com.rk.components.TextCard
 import com.rk.components.XedDialog
@@ -122,58 +129,150 @@ fun sysconf(): Long {
     return Os.sysconf(OsConstants._SC_CLK_TCK)
 }
 
-fun isAppInstalled(context: Context, packageName: String): Boolean {
-    return try {
-        context.packageManager.getPackageInfo(packageName, 0)
-        true
-    } catch (e: PackageManager.NameNotFoundException) {
-        false
-    }
+const val PER_USER_RANGE = 100000
+
+fun getAppUserId(uid: Int): Int = uid / PER_USER_RANGE
+
+fun looksLikePackageName(value: String): Boolean {
+    return value.isNotEmpty() && !value.startsWith("/") &&
+            !value.contains(':') && !value.contains(' ')
 }
 
-fun getApkNameFromPackage(context: Context, packageName: String): String? {
-    return try {
-        context.packageManager.getApplicationLabel(
-            context.packageManager.getApplicationInfo(
-                packageName,
-                PackageManager.GET_META_DATA
+class ResolvedApp(
+    val packageName: String,
+    val info: ApplicationInfo?,
+    // Label/icon recovered via LauncherApps when PackageManager cannot resolve the
+    // package in any user visible to us
+    val launcherLabel: String? = null,
+    val launcherIcon: Drawable? = null
+)
+
+// Launchers may query activity metadata for every member of their profile group
+// (main user <-> work profile) without any special permission, while PackageManager
+// reflection across users is hidden-API blocked
+fun getLauncherActivity(context: Context, packageName: String, fullUid: Int): LauncherActivityInfo? {
+    if (packageName.isEmpty()) return null
+    return runCatching {
+        val la = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as? LauncherApps
+        la?.getActivityList(packageName, UserHandle.getUserHandleForUid(fullUid))?.firstOrNull()
+    }.onFailure {
+        Log.w("TMDebug", "LauncherApps lookup failed for $packageName uid=$fullUid: $it")
+    }.getOrNull()
+}
+
+fun getApplicationInfoAnyUser(context: Context, packageName: String, userId: Int): ApplicationInfo? {
+    val pm = context.packageManager
+    try {
+        return pm.getApplicationInfo(packageName, 0)
+    } catch (e: PackageManager.NameNotFoundException) {
+        // Not visible in the calling user; the process may belong to another Android user
+    }
+
+    if (userId <= 0 || userId == getAppUserId(android.os.Process.myUid())) return null
+
+    return runCatching {
+        val userHandle = UserHandle.getUserHandleForUid(userId * PER_USER_RANGE)
+        try {
+            PackageManager::class.java.getMethod(
+                "getApplicationInfoAsUser",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                UserHandle::class.java
+            ).invoke(pm, packageName, 0, userHandle) as ApplicationInfo
+        } catch (e: NoSuchMethodException) {
+            PackageManager::class.java.getMethod(
+                "getApplicationInfoAsUser",
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            ).invoke(pm, packageName, 0, userId) as ApplicationInfo
+        }
+    }.onFailure {
+        Log.w("TMDebug", "getApplicationInfoAsUser failed for $packageName user=$userId: $it")
+    }.getOrNull()
+}
+
+fun resolveAppInfo(
+    context: Context,
+    cmdLine: String,
+    uid: Int,
+    daemonPkg: String? = null,
+    daemonUser: Int = -1
+): ResolvedApp? {
+    val userId = if (daemonUser >= 0) daemonUser else getAppUserId(uid)
+
+    // The daemon enumerates packages for every running user as root; when it reports
+    // the owning package the name is authoritative even if PackageManager hides other
+    // users (label/icon then degrade gracefully to best-effort). Trust it only when the
+    // cmdline names that same package (":subprocess" suffixes count); path-like cmdlines
+    // (shared-uid native binaries) keep their raw name.
+    if (!daemonPkg.isNullOrEmpty() &&
+        (cmdLine == daemonPkg || cmdLine.startsWith("$daemonPkg:"))
+    ) {
+        getApplicationInfoAnyUser(context, daemonPkg, userId)?.let {
+            return ResolvedApp(daemonPkg, it)
+        }
+        // Package lives in another user; launchers still see its profile-group members
+        getLauncherActivity(context, daemonPkg, uid)?.let {
+            return ResolvedApp(
+                daemonPkg,
+                null,
+                launcherLabel = it.label.toString(),
+                launcherIcon = it.getIcon(0)
             )
-        ).toString()
-    } catch (e: PackageManager.NameNotFoundException) {
+        }
+        return ResolvedApp(daemonPkg, null)
+    }
+
+    if (!looksLikePackageName(cmdLine)) return null
+
+    getApplicationInfoAnyUser(context, cmdLine, userId)?.let { return ResolvedApp(cmdLine, it) }
+
+    if (uid < android.os.Process.FIRST_APPLICATION_UID) return null
+
+    // The package is not resolvable in our user but the uid encodes its owning user;
+    // fall back to the packages associated with the full uid (covers work profiles etc.)
+    val packages = try {
+        context.packageManager.getPackagesForUid(uid)
+    } catch (e: Exception) {
         null
+    } ?: return null
+
+    val info = packages.firstNotNullOfOrNull { getApplicationInfoAnyUser(context, it, userId) }
+    if (info != null) return ResolvedApp(info.packageName, info)
+
+    // Last resort before giving up: recover label/icon through LauncherApps even
+    // though PackageManager cannot hand out the ApplicationInfo itself
+    return packages.firstOrNull()?.let { pkgName ->
+        val launcherActivity = getLauncherActivity(context, pkgName, uid)
+        ResolvedApp(
+            pkgName,
+            null,
+            launcherLabel = launcherActivity?.label?.toString(),
+            launcherIcon = launcherActivity?.getIcon(0)
+        )
     }
 }
 
-fun isSystemApp(context: Context, packageName: String): Boolean {
-    return try {
-        val packageManager = context.packageManager
-        val applicationInfo = packageManager.getApplicationInfo(packageName, 0)
-        (applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-    } catch (e: PackageManager.NameNotFoundException) {
-        // Package not found
-        false
-    }
-}
-
-
-fun getAppIcon(context: Context, packageName: String): Drawable? {
-    return try {
-        val pm = context.packageManager
-        val appInfo = pm.getApplicationInfo(packageName, 0)
-        pm.getApplicationIcon(appInfo)
-    } catch (e: PackageManager.NameNotFoundException) {
-        null // App not found
-    }
-}
-
-fun drawableTobitMap(drawable: Drawable?): Bitmap? {
+fun drawableTobitMap(drawable: Drawable?, maxDim: Int = 0): Bitmap? {
     return drawable?.let {
-        if (it is BitmapDrawable) {
+        if (it is BitmapDrawable &&
+            (maxDim <= 0 || maxOf(it.bitmap.width, it.bitmap.height) <= maxDim)
+        ) {
             it.bitmap
         } else {
             val width = maxOf(1, it.intrinsicWidth)
             val height = maxOf(1, it.intrinsicHeight)
-            val bitmap = createBitmap(width, height)
+            var targetWidth = width
+            var targetHeight = height
+            // Cap the rendered size so full-size launcher drawables don't allocate
+            // screen-sized bitmaps for list thumbnails
+            if (maxDim > 0 && maxOf(width, height) > maxDim) {
+                val scale = maxDim.toFloat() / maxOf(width, height)
+                targetWidth = maxOf(1, (width * scale).roundToInt())
+                targetHeight = maxOf(1, (height * scale).roundToInt())
+            }
+            val bitmap = createBitmap(targetWidth, targetHeight)
             val canvas = Canvas(bitmap)
             it.setBounds(0, 0, canvas.width, canvas.height)
             it.draw(canvas)
@@ -182,17 +281,25 @@ fun drawableTobitMap(drawable: Drawable?): Bitmap? {
     }
 }
 
-fun getAppIconBitmap(context: Context, packageName: String): Bitmap? {
-    val drawable = getAppIcon(context, packageName)
-    return drawableTobitMap(drawable)
+fun getAppIconBitmap(context: Context, appInfo: ApplicationInfo, maxDim: Int = 0): Bitmap? {
+    val drawable = try {
+        appInfo.loadIcon(context.packageManager)
+    } catch (e: Exception) {
+        null
+    }
+    return drawableTobitMap(drawable, maxDim)
 }
 
 
 suspend fun killProc(proc: ProcessViewModel.Process): Boolean {
     var killResult = false
 
-    val isApk = isAppInstalled(TaskManager.requireContext(), proc.cmdLine)
+    val context = TaskManager.requireContext()
 
+    // Only force-stop when the cmdline is exactly the package being killed;
+    // anything else (native binaries, :subprocesses) keeps the single-pid kill path
+    val app = resolveAppInfo(context, proc.cmdLine, proc.uid, proc.pkg.takeIf { it.isNotEmpty() }, proc.pkgUser)
+    val appPackage = app?.packageName?.takeIf { it == proc.cmdLine }
 
     killResult = withContext(Dispatchers.IO) {
         runCatching {
@@ -210,9 +317,10 @@ suspend fun killProc(proc: ProcessViewModel.Process): Boolean {
 
                 // Send kill command
                 val cmd = JSONObject().apply {
-                    if (isApk) {
+                    if (appPackage != null) {
                         put("cmd", "FORCE_STOP")
-                        put("pkg", proc.cmdLine)
+                        put("pkg", appPackage)
+                        put("user", if (proc.pkgUser >= 0) proc.pkgUser else getAppUserId(proc.uid))
                     } else {
                         put("cmd", "KILL")
                         put("pid", proc.pid)
@@ -252,7 +360,9 @@ fun ProcessInfo(
     val scope = rememberCoroutineScope()
     val cpuUsage = remember { mutableIntStateOf(-1) }
 
-    LaunchedEffect(proc) {
+    // Keyed by pid, not the instance: every list refresh replaces ProcessUiModel
+    // instances and would otherwise restart these loops into a refresh storm
+    LaunchedEffect(proc.proc.pid) {
         username.value = getUsernameFromUid(proc?.proc?.uid!!) ?: proc?.proc?.uid.toString()
     }
 
@@ -357,7 +467,9 @@ fun ProcessInfo(
                         label = if (proc.isPinned.value) stringResource(strings.unpin) else stringResource(strings.pin),
                         description = if (proc.isPinned.value) stringResource(strings.unpin_desc) else stringResource(strings.pin_desc),
                         default = proc.isPinned.value,
-                        isEnabled = bridge?.isPro()?.value == true,
+                        // TEMP: premium check removed for local debugging; restore
+                        // `isEnabled = bridge?.isPro()?.value == true` before release
+                        isEnabled = true,
                         showSwitch = true,
                         sideEffect = {
                             viewModel.togglePin(proc)
@@ -369,11 +481,18 @@ fun ProcessInfo(
                     var name by remember { mutableStateOf(strings.loading.getString()) }
 
 
-                    LaunchedEffect(proc) {
-                        name = getApkNameFromPackage(
-                            TaskManager.requireContext(),
-                            proc!!.proc.cmdLine
-                        ) ?: proc!!.proc.name
+                    LaunchedEffect(proc.proc.pid) {
+                        val context = TaskManager.requireContext()
+                        val resolved = resolveAppInfo(
+                            context,
+                            proc!!.proc.cmdLine,
+                            proc.proc.uid,
+                            proc.proc.pkg.takeIf { it.isNotEmpty() },
+                            proc.proc.pkgUser
+                        )
+                        name = resolved?.info?.loadLabel(context.packageManager)?.toString()
+                            ?: resolved?.packageName
+                            ?: proc!!.proc.name
                     }
 
                     TextCard(text = stringResource(strings.name), description = name.trim())
@@ -392,6 +511,19 @@ fun ProcessInfo(
                     )
                     TextCard(text = stringResource(strings.user), description = username.value)
 
+                    // Owning Android user: prefer the daemon-reported owner of the package,
+                    // fall back to decoding it from the process uid
+                    val androidUserId =
+                        if (proc.proc.pkgUser >= 0) proc.proc.pkgUser else getAppUserId(proc.proc.uid)
+                    TextCard(
+                        text = "Android user",
+                        description = if (androidUserId == getAppUserId(android.os.Process.myUid())) {
+                            "Main user (user $androidUserId)"
+                        } else {
+                            "User $androidUserId"
+                        }
+                    )
+
 
                     LaunchedEffect(Unit) {
                         daemon_messages.collect { message ->
@@ -404,7 +536,7 @@ fun ProcessInfo(
                         }
                     }
 
-                    LaunchedEffect(proc) {
+                    LaunchedEffect(proc.proc.pid) {
                         while (isActive) {
                             val cmd = JSONObject().apply {
                                 put("cmd", "PING_PID_CPU")
@@ -412,6 +544,16 @@ fun ProcessInfo(
                             }
                             send_daemon_messages.emit(cmd.toString())
                             delay(1000)
+                        }
+                    }
+
+                    // Keep the child-process listing (and cpu figures) fresh while
+                    // this page is open; the processes screen stops polling once
+                    // navigated away
+                    LaunchedEffect(proc.proc.pid) {
+                        while (isActive) {
+                            viewModel.refreshProcessesAuto()
+                            delay(5000)
                         }
                     }
 
@@ -447,6 +589,17 @@ fun ProcessInfo(
                             text = stringResource(strings.actual_ram_usage),
                             description = formatSize(proc!!.proc.residentSetSizeKb)
                         )
+                    }
+
+                    if (proc.proc.swapUsageKb > 0) {
+                        TextCard(
+                            text = "Swapped out",
+                            description = formatSize(proc.proc.swapUsageKb)
+                        )
+                    }
+
+                    if (proc.proc.frozen) {
+                        TextCard(text = "Frozen", description = "true (cgroup freezer)")
                     }
 
 
@@ -544,6 +697,73 @@ fun ProcessInfo(
 
                             })
 
+                    }
+
+                    val childProcesses = viewModel.uiProcesses.value.filter {
+                        it.proc.parentPid == proc!!.proc.pid && it.proc.pid != proc.proc.pid
+                    }
+                    if (childProcesses.isNotEmpty()) {
+                        var childListExpanded by rememberSaveable { mutableStateOf(false) }
+
+                        SettingsToggle(
+                            label = "Child processes",
+                            description = childProcesses.size.toString(),
+                            default = false,
+                            showSwitch = false,
+                            endWidget = {
+                                Icon(
+                                    modifier = Modifier
+                                        .padding(end = 16.dp)
+                                        .rotate(if (childListExpanded) 180f else 0f),
+                                    imageVector = Icons.Outlined.KeyboardArrowDown,
+                                    contentDescription = null
+                                )
+                            },
+                            sideEffect = {
+                                childListExpanded = !childListExpanded
+                            }
+                        )
+
+                        AnimatedVisibility(visible = childListExpanded) {
+                            // AnimatedVisibility stacks children like a Box; rows
+                            // need an explicit Column or they draw on top of each other
+                            Column {
+                                childProcesses.forEach { child ->
+                                    val childDesc = buildString {
+                                        append("PID ${child.proc.pid} · ")
+                                        append(String.format(java.util.Locale.ENGLISH, "%.1f", child.proc.cpuUsage))
+                                        append("% · ${child.proc.memoryUsageKb / 1024} MB")
+                                        if (child.proc.swapUsageKb > 0) {
+                                            append(" · ⇄ ${child.proc.swapUsageKb / 1024} MB")
+                                        }
+                                        if (child.proc.frozen) {
+                                            append(" · ❄")
+                                        }
+                                    }
+                                    SettingsToggle(
+                                        label = child.name,
+                                        description = childDesc,
+                                        default = false,
+                                        showSwitch = false,
+                                        endWidget = {
+                                            Icon(
+                                                modifier = Modifier.padding(end = 16.dp),
+                                                imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                                                contentDescription = null
+                                            )
+                                        },
+                                        sideEffect = {
+                                            scope.launch(Dispatchers.IO) {
+                                                withContext(Dispatchers.Main){
+                                                    navController.navigate(
+                                                        SettingsRoutes.ProcessInfo.createRoute(child)
+                                                    )
+                                                }
+                                            }
+                                        })
+                                }
+                            }
+                        }
                     }
 
                     val context = LocalContext.current
@@ -682,12 +902,24 @@ fun ProcessInfo(
 
 
 suspend fun getUsernameFromUid(uid: Int): String? = withContext(Dispatchers.IO) {
-    return@withContext try {
+    val shellName = try {
         val process = ProcessBuilder("id", "-nu", uid.toString()).start()
         val reader = BufferedReader(InputStreamReader(process.inputStream))
-        reader.readLine()?.trim()
+        reader.readLine()?.trim()?.takeIf { name ->
+            name.isNotEmpty() && name.any { !it.isDigit() }
+        }
     } catch (e: Exception) {
         null
+    }
+
+    // Android app uids have no passwd entry; resolve them through PackageManager
+    shellName ?: run {
+        try {
+            TaskManager.requireContext().packageManager
+                .getPackagesForUid(uid)?.firstOrNull { it.isNotEmpty() }
+        } catch (e: Exception) {
+            null
+        }
     }
 }
 
